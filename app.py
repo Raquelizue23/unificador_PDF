@@ -1,19 +1,141 @@
 from __future__ import annotations
 
-import sys
+import copy
+import importlib
+import io
+import tempfile
 from pathlib import Path
 
 import streamlit as st
 
-# ---------------------------------------------------------------------------
-# Importar funciones del modulo principal (sin ejecutar main())
-# ---------------------------------------------------------------------------
-sys.path.insert(0, str(Path(__file__).parent))
-from create_pdf import unir_pdfs, PROPORCION_PIE_PAGINA
+PROPORCION_PIE_PAGINA = 0.08
+
 
 # ---------------------------------------------------------------------------
-# Configuracion de la pagina
+# Logica de union de PDFs (opera sobre bytes, sin rutas locales)
 # ---------------------------------------------------------------------------
+
+def cargar_libreria_pdf():
+    for nombre_modulo in ("pypdf", "PyPDF2"):
+        try:
+            modulo = importlib.import_module(nombre_modulo)
+            return modulo.PdfReader, modulo.PdfWriter, modulo.Transformation
+        except ModuleNotFoundError:
+            continue
+    raise ModuleNotFoundError(
+        "No se encontro una libreria compatible. Instala 'pypdf' con: pip install pypdf"
+    )
+
+
+def leer_paginas_desde_bytes(pdf_reader, contenido: bytes, nombre: str) -> list:
+    lector = pdf_reader(io.BytesIO(contenido))
+    if lector.is_encrypted:
+        try:
+            lector.decrypt("")
+        except Exception as error:
+            raise RuntimeError(f"No se pudo leer el PDF protegido: {nombre}") from error
+    return list(lector.pages)
+
+
+def aplicar_pie_de_pagina(pagina, pagina_plantilla, transformacion_pdf, proporcion_pie: float):
+    pie = copy.deepcopy(pagina_plantilla)
+    ancho_fuente = float(pie.mediabox.width)
+    alto_fuente = float(pie.mediabox.height)
+    ancho_destino = float(pagina.mediabox.width)
+    alto_destino = float(pagina.mediabox.height)
+
+    altura_pie_fuente = alto_fuente * proporcion_pie
+    altura_pie_destino = alto_destino * proporcion_pie
+
+    if altura_pie_fuente <= 0 or altura_pie_destino <= 0:
+        return pagina
+
+    limite_inferior = float(pie.mediabox.bottom)
+    limite_superior = min(limite_inferior + altura_pie_fuente, float(pie.mediabox.top))
+
+    pie.mediabox.lower_left = (float(pie.mediabox.left), limite_inferior)
+    pie.mediabox.upper_right = (float(pie.mediabox.right), limite_superior)
+    pie.cropbox.lower_left = (float(pie.cropbox.left), limite_inferior)
+    pie.cropbox.upper_right = (float(pie.cropbox.right), limite_superior)
+
+    escala_x = ancho_destino / ancho_fuente
+    escala_y = altura_pie_destino / altura_pie_fuente
+    transformacion = transformacion_pdf().scale(sx=escala_x, sy=escala_y)
+    pagina.merge_transformed_page(pie, transformacion, over=True)
+    return pagina
+
+
+def unir_pdfs_desde_uploads(
+    archivos_subidos: list,
+    plantilla_subida=None,
+    proporcion_pie: float = PROPORCION_PIE_PAGINA,
+) -> tuple[bytes, int, int, list[str]]:
+    """
+    Recibe listas de UploadedFile de Streamlit.
+    Devuelve (pdf_bytes, archivos_procesados, total_paginas, errores).
+    """
+    pdf_reader, pdf_writer, transformacion_pdf = cargar_libreria_pdf()
+    escritor = pdf_writer()
+    errores: list[str] = []
+    paginas_consolidadas = []
+    pagina_pie = None
+
+    # Ordenar archivos subidos por nombre (igual que la version CLI)
+    archivos_ordenados = sorted(archivos_subidos, key=lambda f: f.name.lower())
+
+    # Procesar plantilla si se subio
+    if plantilla_subida:
+        try:
+            contenido_plantilla = plantilla_subida.read()
+            paginas_plantilla = leer_paginas_desde_bytes(
+                pdf_reader, contenido_plantilla, plantilla_subida.name
+            )
+            if not paginas_plantilla:
+                raise RuntimeError(f"La plantilla {plantilla_subida.name} no contiene paginas.")
+            # Leer de nuevo para el pie (los streams ya se consumieron)
+            paginas_plantilla_pie = leer_paginas_desde_bytes(
+                pdf_reader, contenido_plantilla, plantilla_subida.name
+            )
+            paginas_consolidadas.extend(paginas_plantilla)
+            pagina_pie = paginas_plantilla_pie[0]
+        except Exception as error:
+            raise RuntimeError(f"No fue posible cargar la plantilla: {error}") from error
+
+    # Procesar archivos PDF
+    archivos_procesados = 0
+    for archivo in archivos_ordenados:
+        try:
+            contenido = archivo.read()
+            paginas = leer_paginas_desde_bytes(pdf_reader, contenido, archivo.name)
+            paginas_consolidadas.extend(paginas)
+            archivos_procesados += 1
+        except Exception as error:
+            errores.append(f"Error al procesar {archivo.name}: {error}")
+
+    if archivos_procesados == 0:
+        raise RuntimeError("No fue posible unir ningun archivo PDF valido.")
+
+    total_paginas = len(paginas_consolidadas)
+
+    # Aplicar pie de pagina si hay plantilla
+    if pagina_pie:
+        paginas_consolidadas = [
+            aplicar_pie_de_pagina(pagina, pagina_pie, transformacion_pdf, proporcion_pie)
+            for pagina in paginas_consolidadas
+        ]
+
+    for pagina in paginas_consolidadas:
+        escritor.add_page(pagina)
+
+    buffer = io.BytesIO()
+    escritor.write(buffer)
+    return buffer.getvalue(), archivos_procesados, total_paginas, errores
+
+
+# ---------------------------------------------------------------------------
+# Interfaz Streamlit
+# ---------------------------------------------------------------------------
+
 st.set_page_config(
     page_title="Unificador de PDFs",
     page_icon="📄",
@@ -22,80 +144,66 @@ st.set_page_config(
 
 st.title("📄 Unificador de PDFs")
 st.markdown(
-    "Une todos los archivos PDF de una carpeta en un solo documento. "
-    "Opcionalmente puedes indicar una carpeta de destino para el resultado."
+    "Sube los archivos PDF que deseas unir y descarga el resultado consolidado."
 )
 
 # ---------------------------------------------------------------------------
-# Formulario
+# Carga de archivos
 # ---------------------------------------------------------------------------
-with st.form("form_unificar"):
-    ruta_origen = st.text_input(
-        "Ruta de la carpeta con los archivos PDF *",
-        placeholder="Ejemplo: C:\\Documentos\\PDFs",
-        help="Carpeta que contiene los archivos PDF que deseas unir.",
-    )
+archivos_subidos = st.file_uploader(
+    "Selecciona los archivos PDF a unir *",
+    type="pdf",
+    accept_multiple_files=True,
+    help="Puedes seleccionar varios archivos a la vez. Se uniran en orden alfabetico por nombre.",
+)
 
-    ruta_destino = st.text_input(
-        "Ruta de destino para el PDF resultado (opcional)",
-        placeholder="Ejemplo: C:\\Documentos\\resultado.pdf",
-        help=(
-            "Ruta completa donde se guardara el PDF unificado. "
-            "Si no se indica, se crea 'pdf_unido.pdf' dentro de la carpeta origen."
-        ),
-    )
+plantilla_subida = st.file_uploader(
+    "Plantilla PDF (opcional)",
+    type="pdf",
+    accept_multiple_files=False,
+    help=(
+        "PDF del que se tomara el pie de pagina. Sus paginas se insertan al inicio "
+        "y su franja inferior se aplica como pie en todas las paginas."
+    ),
+)
 
-    proporcion_pie = st.slider(
-        "Proporcion del pie de pagina (si hay plantilla)",
-        min_value=0.01,
-        max_value=1.0,
-        value=PROPORCION_PIE_PAGINA,
-        step=0.01,
-        help=(
-            "Fraccion vertical de la plantilla que se usara como pie de pagina. "
-            "Solo aplica si existe un archivo 'plantilla.pdf' en la carpeta origen."
-        ),
-    )
+proporcion_pie = st.slider(
+    "Proporcion del pie de pagina",
+    min_value=0.01,
+    max_value=1.0,
+    value=PROPORCION_PIE_PAGINA,
+    step=0.01,
+    disabled=plantilla_subida is None,
+    help="Solo aplica si subiste una plantilla. Fraccion vertical usada como pie de pagina.",
+)
 
-    ejecutar = st.form_submit_button("Unir PDFs", type="primary", use_container_width=True)
+nombre_salida = st.text_input(
+    "Nombre del archivo resultado (opcional)",
+    placeholder="pdf_unido.pdf",
+    help="Nombre con el que se descargara el PDF unificado. Por defecto: pdf_unido.pdf",
+)
+
+ejecutar = st.button("Unir PDFs", type="primary", use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # Procesamiento
 # ---------------------------------------------------------------------------
 if ejecutar:
-    # Validar campo obligatorio
-    if not ruta_origen.strip():
-        st.error("Debes indicar la ruta de la carpeta con los archivos PDF.")
+    if not archivos_subidos:
+        st.error("Debes subir al menos un archivo PDF.")
         st.stop()
 
-    carpeta = Path(ruta_origen.strip()).expanduser().resolve()
+    nombre_final = nombre_salida.strip() or "pdf_unido.pdf"
+    if not nombre_final.lower().endswith(".pdf"):
+        nombre_final += ".pdf"
 
-    if not carpeta.exists():
-        st.error(f"La ruta indicada no existe: `{carpeta}`")
-        st.stop()
-
-    if not carpeta.is_dir():
-        st.error(f"La ruta indicada no es una carpeta: `{carpeta}`")
-        st.stop()
-
-    # Resolver ruta de salida
-    if ruta_destino.strip():
-        salida = Path(ruta_destino.strip()).expanduser().resolve()
-    else:
-        salida = carpeta / "pdf_unido.pdf"
-
-    # Ejecutar unificacion
     with st.spinner("Uniendo archivos PDF..."):
         try:
-            archivos_procesados, total_paginas, errores, ruta_plantilla = unir_pdfs(
-                carpeta=carpeta,
-                salida=salida,
-                plantilla=None,
+            pdf_bytes, archivos_procesados, total_paginas, errores = unir_pdfs_desde_uploads(
+                archivos_subidos=archivos_subidos,
+                plantilla_subida=plantilla_subida,
                 proporcion_pie=proporcion_pie,
             )
-        except FileNotFoundError as e:
-            st.error(f"No se encontraron archivos: {e}")
-            st.stop()
         except RuntimeError as e:
             st.error(f"Error durante el proceso: {e}")
             st.stop()
@@ -103,8 +211,7 @@ if ejecutar:
             st.error(f"Error inesperado: {e}")
             st.stop()
 
-    # Resultado exitoso
-    st.success("✅ PDF unificado generado correctamente.")
+    st.success("PDF unificado generado correctamente.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -112,28 +219,20 @@ if ejecutar:
     with col2:
         st.metric("Paginas totales", total_paginas)
 
-    st.info(f"Archivo guardado en: `{salida}`")
-
-    if ruta_plantilla:
-        st.info(f"Plantilla aplicada desde: `{ruta_plantilla}`")
+    if plantilla_subida:
+        st.info(f"Plantilla aplicada: `{plantilla_subida.name}`")
     else:
-        st.caption("No se detecto ninguna plantilla (plantilla.pdf).")
+        st.caption("No se uso plantilla.")
 
     if errores:
-        with st.expander("⚠️ Problemas encontrados durante el proceso"):
+        with st.expander("Problemas encontrados durante el proceso"):
             for error in errores:
                 st.warning(error)
 
-    # Ofrecer descarga del PDF generado
-    try:
-        with open(salida, "rb") as f:
-            pdf_bytes = f.read()
-        st.download_button(
-            label="⬇️ Descargar PDF unificado",
-            data=pdf_bytes,
-            file_name=salida.name,
-            mime="application/pdf",
-            use_container_width=True,
-        )
-    except Exception:
-        st.caption("No fue posible ofrecer la descarga directa del archivo.")
+    st.download_button(
+        label="Descargar PDF unificado",
+        data=pdf_bytes,
+        file_name=nombre_final,
+        mime="application/pdf",
+        use_container_width=True,
+    )
