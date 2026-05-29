@@ -5,7 +5,9 @@ import importlib
 import io
 import tempfile
 from pathlib import Path
-
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+import io
 import streamlit as st
 
 PROPORCION_PIE_PAGINA = 0.08
@@ -64,6 +66,53 @@ def aplicar_pie_de_pagina(pagina, pagina_plantilla, transformacion_pdf, proporci
     pagina.merge_transformed_page(pie, transformacion, over=True)
     return pagina
 
+def crear_overlay_paginacion(
+    pdf_reader,
+    ancho,
+    alto,
+    pagina_actual,
+    total_paginas,
+):
+    buffer = io.BytesIO()
+
+    c = canvas.Canvas(buffer, pagesize=(ancho, alto))
+
+    texto = f"Página {pagina_actual} de {total_paginas}"
+
+    c.setFont("Helvetica", 9)
+
+    c.drawRightString(
+        ancho - 15 * mm,
+        8 * mm,
+        texto
+    )
+
+    c.save()
+
+    buffer.seek(0)
+
+    return pdf_reader(buffer).pages[0]
+
+def aplicar_numeracion(
+    pagina,
+    pdf_reader,
+    pagina_actual,
+    total_paginas,
+):
+    ancho = float(pagina.mediabox.width)
+    alto = float(pagina.mediabox.height)
+
+    overlay = crear_overlay_paginacion(
+        pdf_reader,
+        ancho,
+        alto,
+        pagina_actual,
+        total_paginas,
+    )
+
+    pagina.merge_page(overlay)
+
+    return pagina
 
 def unir_pdfs_desde_uploads(
     archivos_subidos: list,
@@ -97,7 +146,7 @@ def unir_pdfs_desde_uploads(
                 pdf_reader, contenido_plantilla, plantilla_subida.name
             )
             paginas_consolidadas.extend(paginas_plantilla)
-            pagina_pie = paginas_plantilla_pie[0]
+            pagina_pie = paginas_plantilla_pie[1]
         except Exception as error:
             raise RuntimeError(f"No fue posible cargar la plantilla: {error}") from error
 
@@ -119,10 +168,21 @@ def unir_pdfs_desde_uploads(
 
     # Aplicar pie de pagina si hay plantilla
     if pagina_pie:
-        paginas_consolidadas = [
-            aplicar_pie_de_pagina(pagina, pagina_pie, transformacion_pdf, proporcion_pie)
-            for pagina in paginas_consolidadas
-        ]
+        for i in range(1, len(paginas_consolidadas)):
+
+            paginas_consolidadas[i] = aplicar_pie_de_pagina(
+                paginas_consolidadas[i],
+                pagina_pie,
+                transformacion_pdf,
+                proporcion_pie
+            )
+
+            paginas_consolidadas[i] = aplicar_numeracion(
+                paginas_consolidadas[i],
+                pdf_reader,
+                i + 1,
+                total_paginas
+            )
 
     for pagina in paginas_consolidadas:
         escritor.add_page(pagina)
